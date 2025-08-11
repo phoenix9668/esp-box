@@ -40,6 +40,7 @@ audio_play_finish_cb_t audio_play_finish_cb = NULL;
 
 extern sr_data_t *g_sr_data;
 extern esp_err_t start_openai(uint8_t *audio, int audio_len);
+extern esp_err_t start_customai(uint8_t *audio, int audio_len);
 extern int Cache_WriteBack_Addr(uint32_t addr, uint32_t size);
 
 /* main function */
@@ -48,10 +49,13 @@ void mute_btn_handler(void *handle, void *arg)
 #if !CONFIG_BSP_BOARD_ESP32_S3_BOX_Lite
     button_event_t event = (button_event_t)arg;
 
-    if (BUTTON_PRESS_DOWN == event) {
+    if (BUTTON_PRESS_DOWN == event)
+    {
         esp_rom_printf(DRAM_STR("Audio Mute On\r\n"));
         mute_flag = true;
-    } else {
+    }
+    else
+    {
         esp_rom_printf(DRAM_STR("Audio Mute Off\r\n"));
         mute_flag = false;
     }
@@ -62,7 +66,8 @@ static esp_err_t audio_mute_function(AUDIO_PLAYER_MUTE_SETTING setting)
 {
     bsp_codec_mute_set(setting == AUDIO_PLAYER_MUTE ? true : false);
     // restore the voice volume upon unmuting
-    if (setting == AUDIO_PLAYER_UNMUTE) {
+    if (setting == AUDIO_PLAYER_UNMUTE)
+    {
         bsp_codec_volume_set(CONFIG_VOLUME_LEVEL, NULL);
     }
     return ESP_OK;
@@ -83,11 +88,13 @@ static esp_err_t audio_codec_set_fs(uint32_t rate, uint32_t bits_cfg, i2s_slot_m
 
 static void audio_player_cb(audio_player_cb_ctx_t *ctx)
 {
-    switch (ctx->audio_event) {
+    switch (ctx->audio_event)
+    {
     case AUDIO_PLAYER_CALLBACK_EVENT_IDLE:
         ESP_LOGI(TAG, "Player IDLE");
         bsp_codec_set_fs(16000, 16, 2);
-        if (audio_play_finish_cb) {
+        if (audio_play_finish_cb)
+        {
             audio_play_finish_cb();
         }
         break;
@@ -120,7 +127,8 @@ void audio_record_init()
     printf("audio_rx_buffer with a size: %zu\n", MAX_FILE_SIZE);
 #endif
 
-    if (record_audio_buffer == NULL || audio_rx_buffer == NULL) {
+    if (record_audio_buffer == NULL || audio_rx_buffer == NULL)
+    {
         printf("Error: Failed to allocate memory for buffers\n");
         return; // Return or handle the error condition appropriately
     }
@@ -128,11 +136,10 @@ void audio_record_init()
     file_iterator_instance_t *file_iterator = file_iterator_new(BSP_SPIFFS_MOUNT_POINT);
     assert(file_iterator != NULL);
 
-    audio_player_config_t config = { .mute_fn = audio_mute_function,
-                                     .write_fn = bsp_i2s_write,
-                                     .clk_set_fn = audio_codec_set_fs,
-                                     .priority = 5
-                                   };
+    audio_player_config_t config = {.mute_fn = audio_mute_function,
+                                    .write_fn = bsp_i2s_write,
+                                    .clk_set_fn = audio_codec_set_fs,
+                                    .priority = 5};
     ESP_ERROR_CHECK(audio_player_new(config));
     audio_player_callback_register(audio_player_cb, NULL);
 }
@@ -140,17 +147,20 @@ void audio_record_init()
 void audio_record_save(int16_t *audio_buffer, int audio_chunksize)
 {
 #if DEBUG_SAVE_PCM
-    if (record_flag) {
+    if (record_flag)
+    {
         uint16_t *record_buff = (uint16_t *)(record_audio_buffer + sizeof(wav_header_t));
         record_buff += record_total_len;
-        for (int i = 0; i < (audio_chunksize - 1); i++) {
-            if (record_total_len < (MAX_FILE_SIZE - sizeof(wav_header_t)) / 2) {
+        for (int i = 0; i < (audio_chunksize - 1); i++)
+        {
+            if (record_total_len < (MAX_FILE_SIZE - sizeof(wav_header_t)) / 2)
+            {
 #if PCM_ONE_CHANNEL
-                record_buff[ i * 1 + 0] = audio_buffer[i * 3 + 0];
+                record_buff[i * 1 + 0] = audio_buffer[i * 3 + 0];
                 record_total_len += 1;
 #else
-                record_buff[ i * 2 + 0] = audio_buffer[i * 3 + 0];
-                record_buff[ i * 2 + 1] = audio_buffer[i * 3 + 1];
+                record_buff[i * 2 + 0] = audio_buffer[i * 3 + 0];
+                record_buff[i * 2 + 1] = audio_buffer[i * 3 + 1];
                 record_total_len += 2;
 #endif
             }
@@ -187,8 +197,8 @@ static esp_err_t audio_record_stop()
     record_total_len *= 2;
 #endif
     file_total_len += record_total_len;
-    ESP_LOGI(TAG, "### record Stop, %" PRIu32 " %" PRIu32 "K", \
-             record_total_len, \
+    ESP_LOGI(TAG, "### record Stop, %" PRIu32 " %" PRIu32 "K",
+             record_total_len,
              record_total_len / 1024);
 
     FILE *fp = fopen("/spiffs/echo_en_wake.wav", "r");
@@ -217,7 +227,8 @@ static esp_err_t audio_record_stop()
 
 #endif
 err:
-    if (fp) {
+    if (fp)
+    {
         fclose(fp);
     }
     return ret;
@@ -243,7 +254,8 @@ esp_err_t audio_play_task(void *filepath)
     ESP_GOTO_ON_FALSE(len > 0, ESP_FAIL, EXIT, TAG, "Read wav header failed");
 
     if (NULL == strstr((char *)wav_head.Subchunk1ID, "fmt") &&
-            NULL == strstr((char *)wav_head.Subchunk2ID, "data")) {
+        NULL == strstr((char *)wav_head.Subchunk2ID, "data"))
+    {
         ESP_LOGI(TAG, "PCM format");
         fseek(fp, 0, SEEK_SET);
         wav_head.SampleRate = 16000;
@@ -259,22 +271,28 @@ esp_err_t audio_play_task(void *filepath)
     bsp_codec_volume_set(CONFIG_VOLUME_LEVEL, NULL);
 
     size_t cnt, total_cnt = 0;
-    do {
+    do
+    {
         /* Read file in chunks into the scratch buffer */
         len = fread(buffer, 1, chunk_size, fp);
-        if (len <= 0) {
+        if (len <= 0)
+        {
             break;
-        } else if (len > 0) {
+        }
+        else if (len > 0)
+        {
             bsp_i2s_write(buffer, len, &cnt, portMAX_DELAY);
             total_cnt += cnt;
         }
     } while (1);
 
 EXIT:
-    if (fp) {
+    if (fp)
+    {
         fclose(fp);
     }
-    if (buffer) {
+    if (buffer)
+    {
         free(buffer);
     }
     return ret;
@@ -288,8 +306,10 @@ void sr_handler_task(void *pvParam)
     printf("sr handle task, mute:%d\n", mute_flag);
 #endif
 
-    while (true) {
-        if (NEED_DELETE && xEventGroupGetBits(g_sr_data->event_group)) {
+    while (true)
+    {
+        if (NEED_DELETE && xEventGroupGetBits(g_sr_data->event_group))
+        {
             xEventGroupSetBits(g_sr_data->event_group, HANDLE_DELETED);
             vTaskDelete(NULL);
         }
@@ -302,42 +322,50 @@ void sr_handler_task(void *pvParam)
         app_sr_get_result(&result, pdMS_TO_TICKS(1 * 1000));
 
 #if !CONFIG_BSP_BOARD_ESP32_S3_BOX_Lite
-        if (mute_state != mute_flag) {
+        if (mute_state != mute_flag)
+        {
             mute_state = mute_flag;
-            if (false == mute_state) {
+            if (false == mute_state)
+            {
                 bsp_codec_set_fs(16000, 16, 2);
             }
         }
 #endif
-        if (ESP_MN_STATE_TIMEOUT == result.state) {
+        if (ESP_MN_STATE_TIMEOUT == result.state)
+        {
             ESP_LOGI(TAG, "ESP_MN_STATE_TIMEOUT");
             audio_record_stop();
             FILE *fp = fopen("/spiffs/waitPlease.mp3", "r");
-            if (fp) {
+            if (fp)
+            {
                 audio_player_play(fp);
             }
-            if (WIFI_STATUS_CONNECTED_OK == wifi_connected_already()) {
-                start_openai((uint8_t *)record_audio_buffer, record_total_len);
+            if (WIFI_STATUS_CONNECTED_OK == wifi_connected_already())
+            {
+                // start_openai((uint8_t *)record_audio_buffer, record_total_len);
+                start_customai((uint8_t *)record_audio_buffer, record_total_len);
             }
             continue;
         }
 
-        if (WAKENET_DETECTED == result.wakenet_mode) {
+        if (WAKENET_DETECTED == result.wakenet_mode)
+        {
             audio_record_start();
 
             // UI show listen
             ui_ctrl_guide_jump();
             ui_ctrl_show_panel(UI_CTRL_PANEL_LISTEN, 0);
 
-            audio_play_task("/spiffs/echo_en_wake.wav");
+            audio_play_task("/spiffs/echo_cn_wake.wav");
             continue;
         }
 
-        if (ESP_MN_STATE_DETECTED & result.state) {
+        if (ESP_MN_STATE_DETECTED & result.state)
+        {
             ESP_LOGI(TAG, "STOP:%d", result.command_id);
             audio_record_stop();
-            audio_play_task("/spiffs/echo_en_ok.wav");
-            //How to stop the transmission, when start_openai begins.
+            audio_play_task("/spiffs/echo_cn_ok.wav");
+            // How to stop the transmission, when start_openai begins.
             continue;
         }
     }
