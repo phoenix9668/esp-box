@@ -5,6 +5,7 @@
  */
 
 #include <string.h>
+#include <sys/param.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -22,6 +23,7 @@
 #include "app_wifi.h"
 #include "settings.h"
 #include "esp_http_client.h"
+#include "esp_tls.h"
 
 #define SCROLL_START_DELAY_S (1.5)
 #define LISTEN_SPEAK_PANEL_DELAY_MS 2000
@@ -32,6 +34,240 @@
 
 static char *TAG = "app_main";
 static sys_param_t *sys_param = NULL;
+#define MAX_HTTP_RECV_BUFFER 512
+#define MAX_HTTP_OUTPUT_BUFFER 2048
+
+esp_err_t _http_event_handler(esp_http_client_event_t *evt)
+{
+    static char *output_buffer; // Buffer to store response of http request from event handler
+    static int output_len;      // Stores number of bytes read
+    switch (evt->event_id)
+    {
+    case HTTP_EVENT_ERROR:
+        ESP_LOGD(TAG, "HTTP_EVENT_ERROR");
+        break;
+    case HTTP_EVENT_ON_CONNECTED:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_CONNECTED");
+        break;
+    case HTTP_EVENT_HEADER_SENT:
+        ESP_LOGD(TAG, "HTTP_EVENT_HEADER_SENT");
+        break;
+    case HTTP_EVENT_ON_HEADER:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+        break;
+    case HTTP_EVENT_ON_DATA:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
+        // Clean the buffer in case of a new request
+        if (output_len == 0 && evt->user_data)
+        {
+            // we are just starting to copy the output data into the use
+            memset(evt->user_data, 0, MAX_HTTP_OUTPUT_BUFFER);
+        }
+        /*
+         *  Check for chunked encoding is added as the URL for chunked encoding used in this example returns binary data.
+         *  However, event handler can also be used in case chunked encoding is used.
+         */
+        if (!esp_http_client_is_chunked_response(evt->client))
+        {
+            // If user_data buffer is configured, copy the response into the buffer
+            int copy_len = 0;
+            if (evt->user_data)
+            {
+                // The last byte in evt->user_data is kept for the NULL character in case of out-of-bound access.
+                copy_len = MIN(evt->data_len, (MAX_HTTP_OUTPUT_BUFFER - output_len));
+                if (copy_len)
+                {
+                    memcpy(evt->user_data + output_len, evt->data, copy_len);
+                }
+            }
+            else
+            {
+                int content_len = esp_http_client_get_content_length(evt->client);
+                if (output_buffer == NULL)
+                {
+                    // We initialize output_buffer with 0 because it is used by strlen() and similar functions therefore should be null terminated.
+                    output_buffer = (char *)calloc(content_len + 1, sizeof(char));
+                    output_len = 0;
+                    if (output_buffer == NULL)
+                    {
+                        ESP_LOGE(TAG, "Failed to allocate memory for output buffer");
+                        return ESP_FAIL;
+                    }
+                }
+                copy_len = MIN(evt->data_len, (content_len - output_len));
+                if (copy_len)
+                {
+                    memcpy(output_buffer + output_len, evt->data, copy_len);
+                }
+            }
+            output_len += copy_len;
+        }
+
+        break;
+    case HTTP_EVENT_ON_FINISH:
+        ESP_LOGD(TAG, "HTTP_EVENT_ON_FINISH");
+        if (output_buffer != NULL)
+        {
+#if CONFIG_EXAMPLE_ENABLE_RESPONSE_BUFFER_DUMP
+            ESP_LOG_BUFFER_HEX(TAG, output_buffer, output_len);
+#endif
+            free(output_buffer);
+            output_buffer = NULL;
+        }
+        output_len = 0;
+        break;
+    case HTTP_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "HTTP_EVENT_DISCONNECTED");
+        int mbedtls_err = 0;
+        esp_err_t err = esp_tls_get_and_clear_last_error((esp_tls_error_handle_t)evt->data, &mbedtls_err, NULL);
+        if (err != 0)
+        {
+            ESP_LOGI(TAG, "Last esp error code: 0x%x", err);
+            ESP_LOGI(TAG, "Last mbedtls failure: 0x%x", mbedtls_err);
+        }
+        if (output_buffer != NULL)
+        {
+            free(output_buffer);
+            output_buffer = NULL;
+        }
+        output_len = 0;
+        break;
+    case HTTP_EVENT_REDIRECT:
+        ESP_LOGD(TAG, "HTTP_EVENT_REDIRECT");
+        esp_http_client_set_header(evt->client, "From", "user@example.com");
+        esp_http_client_set_header(evt->client, "Accept", "text/html");
+        esp_http_client_set_redirection(evt->client);
+        break;
+    }
+    return ESP_OK;
+}
+
+static void http_rest_with_url(uint8_t *audio, int audio_len)
+{
+    // Declare local_response_buffer with size (MAX_HTTP_OUTPUT_BUFFER + 1) to prevent out of bound access when
+    // it is used by functions like strlen(). The buffer should only be used upto size MAX_HTTP_OUTPUT_BUFFER
+    char local_response_buffer[MAX_HTTP_OUTPUT_BUFFER + 1] = {0};
+    // 打印输入统计与预览
+    ESP_LOGI(TAG, "HTTP upload: audio_len=%d", audio_len);
+    if (audio && audio_len > 0)
+    {
+        int preview_n = MIN(audio_len, 32);
+        char preview_line[256] = {0};
+        size_t poff = 0;
+        for (int i = 0; i < preview_n; ++i)
+        {
+            if (poff + 6 >= sizeof(preview_line))
+                break;
+            poff += snprintf(preview_line + poff, sizeof(preview_line) - poff, "%u%s", (unsigned)(uint8_t)audio[i], (i == preview_n - 1) ? "" : ",");
+        }
+        ESP_LOGI(TAG, "audio_first[%d]: %s%s", preview_n, preview_line, (audio_len > preview_n ? ", ..." : ""));
+        if (audio_len > preview_n)
+        {
+            int tail_n = MIN(audio_len, 8);
+            char tail_line[128] = {0};
+            size_t toff = 0;
+            for (int i = audio_len - tail_n; i < audio_len; ++i)
+            {
+                if (toff + 6 >= sizeof(tail_line))
+                    break;
+                toff += snprintf(tail_line + toff, sizeof(tail_line) - toff, "%u%s", (unsigned)(uint8_t)audio[i], (i == audio_len - 1) ? "" : ",");
+            }
+            ESP_LOGI(TAG, "audio_last[%d]: %s", tail_n, tail_line);
+        }
+    }
+    /**
+     * NOTE: All the configuration parameters for http_client must be specified either in URL or as host and path parameters.
+     * If host and path parameters are not set, query parameter will be ignored. In such cases,
+     * query parameter should be specified in URL.
+     *
+     * If URL as well as host and path parameters are specified, values of host and path will be considered.
+     */
+    esp_http_client_config_t config = {
+        .host = "wawa.suanzilianxian.cn",
+        .path = "/upload_audio",
+        .event_handler = _http_event_handler,
+        .user_data = local_response_buffer, // Pass address of local buffer to get response
+        .disable_auto_redirect = true,
+    };
+    ESP_LOGI(TAG, "HTTP request with url =>");
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+
+    // POST - 构造 multipart/form-data，直接使用 WAV 数据
+    ESP_LOGI(TAG, "Using audio data as WAV file: %d bytes", audio_len);
+
+    // 构造 multipart/form-data
+    const char *boundary = "----formdata-esp32-boundary";
+    char form_header[512];
+    char form_footer[256];
+
+    snprintf(form_header, sizeof(form_header),
+             "--%s\r\n"
+             "Content-Disposition: form-data; name=\"audio_file\"; filename=\"audio.wav\"\r\n"
+             "Content-Type: audio/wav\r\n"
+             "\r\n",
+             boundary);
+
+    snprintf(form_footer, sizeof(form_footer),
+             "\r\n--%s\r\n"
+             "Content-Disposition: form-data; name=\"device_id\"\r\n"
+             "\r\n1\r\n--%s--\r\n",
+             boundary, boundary);
+
+    int header_len = strlen(form_header);
+    int footer_len = strlen(form_footer);
+    int total_len = header_len + audio_len + footer_len;
+
+    // 分配完整的 POST 数据
+    char *post_data = (char *)malloc(total_len);
+    if (!post_data)
+    {
+        ESP_LOGE(TAG, "Failed to allocate memory for POST data");
+        esp_http_client_cleanup(client);
+        return;
+    }
+
+    // 组装 multipart 数据
+    memcpy(post_data, form_header, header_len);
+    memcpy(post_data + header_len, audio, audio_len);
+    memcpy(post_data + header_len + audio_len, form_footer, footer_len);
+
+    ESP_LOGI(TAG, "Multipart form data assembled: %d bytes total", total_len);
+    ESP_LOGI(TAG, "Form header: %.*s", MIN(header_len, 200), form_header);
+    ESP_LOGI(TAG, "Audio data: %d bytes", audio_len);
+    ESP_LOGI(TAG, "Form footer: %.*s", MIN(footer_len, 100), form_footer);
+
+    esp_http_client_set_url(client, "http://wawa.suanzilianxian.cn/upload_audio");
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+
+    // 设置 multipart/form-data Content-Type
+    char content_type[128];
+    snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
+    esp_http_client_set_header(client, "Content-Type", content_type);
+
+    esp_http_client_set_post_field(client, post_data, total_len);
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "HTTP POST Status = %d, content_length = %" PRId64,
+                 esp_http_client_get_status_code(client),
+                 esp_http_client_get_content_length(client));
+        // 打印服务器返回的Body（由event handler累计到local_response_buffer）
+        if (local_response_buffer[0] != '\0')
+        {
+            ESP_LOGI(TAG, "HTTP Body: %s", local_response_buffer);
+        }
+        else
+        {
+            ESP_LOGI(TAG, "HTTP Body: <empty or too large>");
+        }
+    }
+    else
+    {
+        ESP_LOGE(TAG, "HTTP POST request failed: %s", esp_err_to_name(err));
+    }
+    free(post_data);
+    esp_http_client_cleanup(client);
+}
 
 /* program flow. This function is called in app_audio.c */
 esp_err_t start_customai(uint8_t *audio, int audio_len)
@@ -39,155 +275,11 @@ esp_err_t start_customai(uint8_t *audio, int audio_len)
     esp_err_t ret = ESP_OK;
     char *post_data = NULL;
     int post_data_len = 0;
-    esp_http_client_handle_t client = NULL;
 
     ESP_LOGI(TAG, "start_customai: audio_len = %d", audio_len);
 
-    // 显示处理中界面
     ui_ctrl_show_panel(UI_CTRL_PANEL_GET, 0);
-
-    // 构建 multipart/form-data 请求体
-    const char *boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
-
-    // 计算所需内存大小
-    int estimated_size = audio_len + 1024; // 音频数据 + 表单头部信息
-    post_data = malloc(estimated_size);
-    if (!post_data)
-    {
-        ESP_LOGE(TAG, "Failed to allocate memory for POST data");
-        ret = ESP_ERR_NO_MEM;
-        goto cleanup;
-    }
-
-    // 构建完整的 multipart/form-data 请求体
-    post_data_len = snprintf(post_data, 512,
-                             "--%s\r\n"
-                             "Content-Disposition: form-data; name=\"device_id\"\r\n"
-                             "\r\n"
-                             "1\r\n"
-                             "--%s\r\n"
-                             "Content-Disposition: form-data; name=\"audio_file\"; filename=\"audio.wav\"\r\n"
-                             "Content-Type: audio/wav\r\n"
-                             "\r\n",
-                             boundary, boundary);
-
-    // 添加音频数据
-    memcpy(post_data + post_data_len, audio, audio_len);
-    post_data_len += audio_len;
-
-    // 添加结束边界
-    int ending_len = snprintf(post_data + post_data_len, 64, "\r\n--%s--\r\n", boundary);
-    post_data_len += ending_len;
-
-    ESP_LOGI(TAG, "Total POST data length: %d", post_data_len);
-
-    // HTTP客户端配置 - 按照官方文档标准配置
-    esp_http_client_config_t config = {
-        .url = "http://wawa.suanzillanxian.cn/upload_audio",
-        .method = HTTP_METHOD_POST,
-        .timeout_ms = 30000,
-    };
-
-    client = esp_http_client_init(&config);
-    if (client == NULL)
-    {
-        ESP_LOGE(TAG, "Failed to initialize HTTP client");
-        ret = ESP_FAIL;
-        goto cleanup;
-    }
-
-    // 设置Content-Type头部
-    char content_type[128];
-    snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
-    esp_http_client_set_header(client, "Content-Type", content_type);
-
-    // 设置POST数据 - 使用官方API
-    esp_http_client_set_post_field(client, post_data, post_data_len);
-
-    // 执行HTTP请求 - 官方推荐的方法
-    ret = esp_http_client_perform(client);
-    if (ret == ESP_OK)
-    {
-        int status_code = esp_http_client_get_status_code(client);
-        int content_length = esp_http_client_get_content_length(client);
-
-        ESP_LOGI(TAG, "HTTP POST Status = %d, content_length = %d", status_code, content_length);
-
-        if (status_code == 200)
-        {
-            // 读取响应数据
-            if (content_length > 0)
-            {
-                char *response_buffer = malloc(content_length + 1);
-                if (response_buffer)
-                {
-                    int data_read = esp_http_client_read(client, response_buffer, content_length);
-                    if (data_read > 0)
-                    {
-                        response_buffer[data_read] = '\0';
-                        ESP_LOGI(TAG, "Response: %s", response_buffer);
-
-                        // 简单解析JSON响应
-                        if (strstr(response_buffer, "\"status\":") && strstr(response_buffer, "\"ok\""))
-                        {
-                            // 成功响应
-                            ui_ctrl_label_show_text(UI_CTRL_LABEL_LISTEN_SPEAK, "Upload successful");
-                            ui_ctrl_label_show_text(UI_CTRL_LABEL_REPLY_CONTENT, "Audio processed successfully");
-                            ui_ctrl_show_panel(UI_CTRL_PANEL_REPLY, 0);
-
-                            // 显示3秒后返回睡眠状态
-                            vTaskDelay(pdMS_TO_TICKS(3000));
-                            ui_ctrl_show_panel(UI_CTRL_PANEL_SLEEP, 0);
-                        }
-                        else
-                        {
-                            // 服务器返回错误
-                            ESP_LOGE(TAG, "Server returned error in response");
-                            ui_ctrl_label_show_text(UI_CTRL_LABEL_LISTEN_SPEAK, "Server error");
-                            ui_ctrl_show_panel(UI_CTRL_PANEL_SLEEP, LISTEN_SPEAK_PANEL_DELAY_MS);
-                            ret = ESP_FAIL;
-                        }
-                    }
-                    free(response_buffer);
-                }
-                else
-                {
-                    ESP_LOGE(TAG, "Failed to allocate response buffer");
-                    ret = ESP_ERR_NO_MEM;
-                }
-            }
-            else
-            {
-                ESP_LOGI(TAG, "Empty response from server");
-                ui_ctrl_label_show_text(UI_CTRL_LABEL_LISTEN_SPEAK, "Empty response");
-                ui_ctrl_show_panel(UI_CTRL_PANEL_SLEEP, LISTEN_SPEAK_PANEL_DELAY_MS);
-            }
-        }
-        else
-        {
-            ESP_LOGE(TAG, "HTTP request failed with status: %d", status_code);
-            ui_ctrl_label_show_text(UI_CTRL_LABEL_LISTEN_SPEAK, "Upload failed");
-            ui_ctrl_show_panel(UI_CTRL_PANEL_SLEEP, LISTEN_SPEAK_PANEL_DELAY_MS);
-            ret = ESP_FAIL;
-        }
-    }
-    else
-    {
-        ESP_LOGE(TAG, "HTTP POST request failed: %s", esp_err_to_name(ret));
-        ui_ctrl_label_show_text(UI_CTRL_LABEL_LISTEN_SPEAK, "Connection failed");
-        ui_ctrl_show_panel(UI_CTRL_PANEL_SLEEP, LISTEN_SPEAK_PANEL_DELAY_MS);
-    }
-
-cleanup:
-    // 清理资源 - 按照官方文档要求
-    if (client)
-    {
-        esp_http_client_cleanup(client);
-    }
-    if (post_data)
-    {
-        free(post_data);
-    }
+    http_rest_with_url((uint8_t *)audio, audio_len);
 
     return ret;
 }
